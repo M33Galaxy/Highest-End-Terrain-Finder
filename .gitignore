@@ -1,0 +1,30 @@
+# 编译产物
+build/
+*.exe
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.ptx
+*.cubin
+*.fatbin
+
+# 扫描 / 探针产物
+*.csv
+*.tsv
+*.bin
+*.txt
+*.log
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

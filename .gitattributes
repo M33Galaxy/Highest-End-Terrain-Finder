@@ -1,0 +1,10 @@
+# 行尾策略：checkout 后与上游文件逐字节一致
+#   .cu  上游为 CRLF → 保持 CRLF
+#   .cuh 上游为 LF   → 保持 LF
+# 存储层统一为 LF，保证 diff / review 仍按文本处理。
+* text=auto eol=lf
+*.cu text eol=crlf
+*.cuh text eol=lf
+*.png binary
+*.jpg binary
+*.bin binary
