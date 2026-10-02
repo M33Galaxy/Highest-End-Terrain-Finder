@@ -64,6 +64,7 @@ typedef struct Cfg {
     int max_seeds;
     long long max_loop_points; /* 0 = 不限 */
     int quiet;
+    double depth_thr; /* D_eff <= 该值的列直接跳过（-1e30 = 关闭过滤） */
 } Cfg;
 
 typedef struct SeedRec {
@@ -86,7 +87,8 @@ typedef struct SeedStat {
     long long loops_ge73 = 0;
     long long cols_ge73 = 0;
     long long c73 = 0, c74 = 0, c75 = 0;
-    long long cols_none = 0; /* <73 或 void */
+    long long cols_none = 0;  /* 通过 D_eff 过滤但 <73 */
+    long long cols_filtered = 0; /* 被 D_eff 过滤掉的列 */
     long long cache_miss = 0; /* 理论不该出现（窗口缓存未覆盖） */
     int max_h = -1;
     int max_x = 0, max_z = 0;
@@ -107,6 +109,8 @@ static void usage(const char *argv0)
             "  --threads N        线程数 (默认 硬件并发)\n"
             "  --max-seeds N      只取 envelope 最高的 N 个种子\n"
             "  --max-loop-points N  每种子最多枚举 N 个循环点 (调试用)\n"
+            "  --depth-thr F      D_eff 过滤阈值 (默认 62; 见 README)\n"
+            "  --no-depth-filter  关闭 D_eff 过滤 (慢, 作对照)\n"
             "  --out FILE         把所有 ≥73 的列写 CSV\n"
             "  --quiet            不打进度\n"
             "  --selftest         内部一致性自检 (缓存版 vs 直算版 vs 完整高度)\n"
@@ -316,12 +320,23 @@ static int run_scan(const Cfg *cfg, std::vector<SeedRec> *seeds, std::vector<Job
             cfg->loop_mode == LOOP_2D ? "2d"
                                       : (cfg->loop_mode == LOOP_CROSS ? "cross" : "1d"),
             K, 2 * K + 1, jobs->size(), cfg->window, cfg->window_step, cfg->threads);
+    if (cfg->depth_thr > -1e29)
+        fprintf(stderr,
+                "depth filter: 跳过 D_eff < %.1f  (该点高度73 需加权噪声 > %.2f,"
+                " 74 需 > %.2f)\n",
+                cfg->depth_thr, 213.3891 - cfg->depth_thr,
+                226.8908 - cfg->depth_thr);
+    else
+        fprintf(stderr, "depth filter: off\n");
 
     for (t = 0; t < cfg->threads; t++) {
         pool.push_back(std::thread([&]() {
             std::vector<EsSurfaceNoise> sn_cache((size_t)nseeds);
             std::vector<EsPerlin> is_cache((size_t)nseeds);
             std::vector<char> ready((size_t)nseeds, 0);
+            const size_t side =
+                (size_t)(2 * cfg->window / cfg->window_step + 1);
+            std::vector<int> sel_x(side * side), sel_z(side * side);
             EsEndWin win;
             long long done = 0;
 
@@ -346,43 +361,64 @@ static int run_scan(const Cfg *cfg, std::vector<SeedRec> *seeds, std::vector<Job
                 x0 = rec.px + (int)llround((double)job.kx * cfg->period);
                 z0 = rec.pz + (int)llround((double)job.kz * cfg->period);
 
-                if (!es_end_win_prepare(&sn_cache[(size_t)job.seed_idx],
-                                        &is_cache[(size_t)job.seed_idx], x0, z0,
-                                        cfg->window, &win)) {
+                if (!es_end_win_prepare_depth(&is_cache[(size_t)job.seed_idx], x0, z0,
+                                              cfg->window, &win)) {
                     std::lock_guard<std::mutex> lk(st->mtx);
                     st->cache_miss++;
                     continue;
                 }
 
                 {
-                    long long n73 = 0, none = 0, miss = 0;
+                    long long n73 = 0, none = 0, miss = 0, filt = 0;
                     int lo_max = -1, lo_x = 0, lo_z = 0;
+                    int nsel = 0, k;
+
+                    /* pass 1: D_eff 过滤 + 标记需要的 cell（此时还没算任何
+                     * SurfaceNoise —— 这是 depth 过滤唯一能真正省下开销的位置） */
                     for (bz = z0 - cfg->window; bz <= z0 + cfg->window;
                          bz += cfg->window_step) {
                         for (bx = x0 - cfg->window; bx <= x0 + cfg->window;
                              bx += cfg->window_step) {
-                            const int h = es_end_height73_cached(&win, bx, bz);
-                            if (h == -2) {
-                                miss++;
+                            if (es_end_win_deff(&win, bx, bz) < cfg->depth_thr) {
+                                filt++;
                                 continue;
                             }
-                            if (h < 0) {
-                                none++; /* <73 或 void 列 */
-                                continue;
-                            }
-                            n73++;
-                            if (h > lo_max) {
-                                lo_max = h;
-                                lo_x = bx;
-                                lo_z = bz;
-                            }
-                            report_hit(&sink, &rec, job.kx, job.kz, x0, z0, bx, bz, h);
+                            sel_x[(size_t)nsel] = bx;
+                            sel_z[(size_t)nsel] = bz;
+                            nsel++;
+                            es_end_win_mark(&win, bx, bz, &win);
                         }
+                    }
+
+                    /* pass 2: 只为被选中的 cell 算 v18/v19 */
+                    es_end_win_fill_noise(&sn_cache[(size_t)job.seed_idx], &win);
+
+                    /* pass 3: 求值 */
+                    for (k = 0; k < nsel; k++) {
+                        const int h = es_end_height73_cached(&win, sel_x[(size_t)k],
+                                                             sel_z[(size_t)k]);
+                        if (h == -2) {
+                            miss++;
+                            continue;
+                        }
+                        if (h < 0) {
+                            none++;
+                            continue;
+                        }
+                        n73++;
+                        if (h > lo_max) {
+                            lo_max = h;
+                            lo_x = sel_x[(size_t)k];
+                            lo_z = sel_z[(size_t)k];
+                        }
+                        report_hit(&sink, &rec, job.kx, job.kz, x0, z0,
+                                   sel_x[(size_t)k], sel_z[(size_t)k], h);
                     }
                     {
                         std::lock_guard<std::mutex> lk(st->mtx);
                         st->loops++;
                         st->cols_none += none;
+                        st->cols_filtered += filt;
                         st->cache_miss += miss;
                         if (n73) {
                             st->loops_ge73++;
@@ -427,7 +463,7 @@ static int run_scan(const Cfg *cfg, std::vector<SeedRec> *seeds, std::vector<Job
            "cols>=73", "maxH");
     {
         long long tot_loops = 0, tot_ge = 0, tot_cols = 0, tot74 = 0, tot75 = 0, tot73 = 0;
-        long long tot_miss = 0;
+        long long tot_miss = 0, tot_filt = 0, tot_none = 0;
         int any73 = 0;
         int i;
         for (i = 0; i < nseeds; i++) {
@@ -450,12 +486,24 @@ static int run_scan(const Cfg *cfg, std::vector<SeedRec> *seeds, std::vector<Job
             tot74 += st->c74;
             tot75 += st->c75;
             tot_miss += st->cache_miss;
+            tot_filt += st->cols_filtered;
+            tot_none += st->cols_none;
         }
         printf("\n合计: 循环点 %lld, 其中含 >=73 的循环点 %lld, >=73 的列 %lld\n",
                tot_loops, tot_ge, tot_cols);
         printf("      含 73 的循环点 %lld, 含 74 的 %lld, 含 75 的 %lld"
                "  (74/75 已即时打屏)\n",
                tot73, tot74, tot75);
+        if (cfg->depth_thr > -1e29) {
+            printf("      D_eff 过滤: 跳过 %lld 列, 求值 %lld 列 (保留 %.3f%%)\n",
+                   tot_filt, tot_none + tot_cols,
+                   100.0 * (double)(tot_none + tot_cols)
+                       / (double)(tot_filt + tot_none + tot_cols));
+            printf("        阈值: 跳过 D_eff < %.1f ⟹ 该点高度73 需加权噪声 > %.2f"
+                   " (74 需 > %.2f)\n",
+                   cfg->depth_thr, 213.3891 - cfg->depth_thr,
+                   226.8908 - cfg->depth_thr);
+        }
         if (tot_miss) printf("      !! 窗口缓存未覆盖的循环点 %lld\n", tot_miss);
         printf("结论: envelope > %.6f 的 %d 个种子里,%s出现 >=73 的真实地表高度\n",
                cfg->env_thr, nseeds, any73 ? "" : "没有");
@@ -514,6 +562,74 @@ static int selftest(void)
         }
     }
     printf("selftest: %d cases, %d failures -> %s\n", n, fail, fail ? "FAIL" : "PASS");
+
+    /* --- 共享 simplex 网格 / D_eff 过滤的等价性 --- */
+    {
+        static const int pos[][2] = {{0, 0},       {12345, -6789}, {1225660, 0},
+                                     {-777, 65536}, {245133, -245133}};
+        int p, f2 = 0, np = 0;
+        for (p = 0; p < (int)(sizeof(pos) / sizeof(pos[0])); p++) {
+            EsSurfaceNoise sn;
+            EsPerlin island;
+            EsEndWin wd, wf, wm;
+            const int xc = pos[p][0], zc = pos[p][1];
+            int i, j, bx, bz;
+
+            es_init_surface_noise_end(&sn, 694195937ULL);
+            es_end_island_init(&island, 694195937ULL);
+
+            /* (1) 网格 depth == 未缓存 depth */
+            if (!es_end_win_prepare_depth(&island, xc, zc, 16, &wd)) { f2++; continue; }
+            for (j = 0; j < wd.ncz; j++)
+                for (i = 0; i < wd.ncx; i++) {
+                    double dref;
+                    np++;
+                    if (wd.isvoid[j][i]) continue;
+                    dref = (double)es_end_height_noise(&island, wd.cx0 + i,
+                                                       wd.cz0 + j, 0)
+                         - 8.0;
+                    if (fabs(dref - wd.d[j][i]) > 1e-9) {
+                        printf("FAIL: grid depth %.6f != uncached %.6f at (%d,%d)\n",
+                               wd.d[j][i], dref, wd.cx0 + i, wd.cz0 + j);
+                        f2++;
+                    }
+                }
+
+            /* (2) 全量路径 */
+            if (!es_end_win_prepare(&sn, &island, xc, zc, 16, &wf)) { f2++; continue; }
+            /* (3) 过滤路径：只标记 D_eff > 62 的列 */
+            if (!es_end_win_prepare_depth(&island, xc, zc, 16, &wm)) { f2++; continue; }
+            for (bz = zc - 16; bz <= zc + 16; bz++)
+                for (bx = xc - 16; bx <= xc + 16; bx++)
+                    if (es_end_win_deff(&wm, bx, bz) >= 62.0)
+                        es_end_win_mark(&wm, bx, bz, &wm);
+            es_end_win_fill_noise(&sn, &wm);
+
+            for (bz = zc - 16; bz <= zc + 16; bz++)
+                for (bx = xc - 16; bx <= xc + 16; bx++) {
+                    const int hf = es_end_height73_cached(&wf, bx, bz);
+                    const double deff = es_end_win_deff(&wf, bx, bz);
+                    np++;
+                    /* 过滤不得丢掉任何 >=73 的列（阈值语义：跳过 D_eff < 62） */
+                    if (hf >= 73 && deff < 62.0) {
+                        printf("FAIL: 过滤会丢命中 h=%d D_eff=%.4f at (%d,%d)\n", hf,
+                               deff, bx, bz);
+                        f2++;
+                    }
+                    if (deff >= 62.0) {
+                        const int hm = es_end_height73_cached(&wm, bx, bz);
+                        if (hm != hf) {
+                            printf("FAIL: 过滤路径 %d != 全量 %d at (%d,%d)\n", hm, hf,
+                                   bx, bz);
+                            f2++;
+                        }
+                    }
+                }
+        }
+        printf("selftest(depth grid + D_eff filter): %d checks, %d failures -> %s\n",
+               np, f2, f2 ? "FAIL" : "PASS");
+        fail += f2;
+    }
     return fail ? 0 : 1;
 }
 
@@ -536,6 +652,7 @@ int main(int argc, char **argv)
     cfg.max_seeds = 0;
     cfg.max_loop_points = 0;
     cfg.quiet = 0;
+    cfg.depth_thr = 62.0;
 
     for (argi = 1; argi < argc; argi++) {
         if (!strcmp(argv[argi], "--hits") && argi + 1 < argc)
@@ -558,6 +675,10 @@ int main(int argc, char **argv)
             cfg.max_seeds = atoi(argv[++argi]);
         else if (!strcmp(argv[argi], "--max-loop-points") && argi + 1 < argc)
             cfg.max_loop_points = atoll(argv[++argi]);
+        else if (!strcmp(argv[argi], "--depth-thr") && argi + 1 < argc)
+            cfg.depth_thr = atof(argv[++argi]);
+        else if (!strcmp(argv[argi], "--no-depth-filter"))
+            cfg.depth_thr = -1e30;
         else if (!strcmp(argv[argi], "--quiet"))
             cfg.quiet = 1;
         else if (!strcmp(argv[argi], "--selftest")) return selftest() ? 0 : 1;
@@ -608,6 +729,10 @@ int main(int argc, char **argv)
     }
     if (!(cfg.period > 0.0)) {
         fprintf(stderr, "--period 非法\n");
+        return 2;
+    }
+    if (!(cfg.depth_thr <= 73.0 && (cfg.depth_thr >= -110.0 || cfg.depth_thr < -1e29))) {
+        fprintf(stderr, "--depth-thr 需在 -110..73 之间（或用 --no-depth-filter）\n");
         return 2;
     }
 

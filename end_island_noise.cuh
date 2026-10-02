@@ -345,20 +345,108 @@ ES_FN int es_end_height73(const EsSurfaceNoise *sn, const EsPerlin *island,
  * W<=64 → ncx,ncz <= 19 < 24。 */
 #define ES_END_WIN_MAXC 24
 
+/* 窗口内所有 cell 共享的「候选中心」simplex 网格。
+ *
+ * es_end_height_noise 的 25×25 邻域只依赖候选中心 (rx,rz)：
+ *     gate = (rsq > 4096 && simplex(rx,rz) < -0.9)
+ *     v^2  = ((|rx|*3439 + |rz|*147) % 13 + 9)^2
+ * 而窗口内相邻 cell 的 /2 中心最多差 1，所以 ncx×ncz 个 cell 各自的 625 次
+ * simplex 可以塌缩成一份 (ncx/2+25)×(ncz/2+25) 的网格：7×7 cell 的窗口是
+ * 49×625 = 30625 次 → 29×29 = 841 次（约 36×）。cell 侧只剩廉价内层循环
+ *     h = min(64*(cx²+cz²), ((oddx-2i)²+(oddz-2j)²) * v²)
+ * 注意 rust 细节：中心用 C 的截断除法 x/2（与 cubiomes 一致），对 cx 单调，
+ * 所以 [cx_lo,cx_hi] 的中心必落在 [cx_lo/2-12, cx_hi/2+12] 内 —— 网格按此构造
+ * 即天然覆盖全部 cell（越界时回退到未缓存路径，见 es_end_height_noise_g）。 */
+#define ES_END_SIM_MAXC 48
+
+typedef struct EsEndSimGrid {
+    int rx0, rz0, nrx, nrz;
+    uint64_t v2[ES_END_SIM_MAXC][ES_END_SIM_MAXC]; /* 0 = 未通过 gate */
+} EsEndSimGrid;
+
+ES_FN int es_end_sim_grid_build(const EsPerlin *island, int cx_lo, int cx_hi,
+                                int cz_lo, int cz_hi, EsEndSimGrid *g)
+{
+    const int rx0 = cx_lo / 2 - 12;
+    const int rx1 = cx_hi / 2 + 12;
+    const int rz0 = cz_lo / 2 - 12;
+    const int rz1 = cz_hi / 2 + 12;
+    int i, j;
+
+    g->rx0 = rx0;
+    g->rz0 = rz0;
+    g->nrx = rx1 - rx0 + 1;
+    g->nrz = rz1 - rz0 + 1;
+    if (g->nrx > ES_END_SIM_MAXC || g->nrz > ES_END_SIM_MAXC) return 0;
+
+    for (j = 0; j < g->nrz; j++) {
+        for (i = 0; i < g->nrx; i++) {
+            uint64_t v2 = 0;
+            if (!es_end_island_center(island, (int64_t)(rx0 + i),
+                                      (int64_t)(rz0 + j), &v2))
+                v2 = 0;
+            g->v2[j][i] = v2;
+        }
+    }
+    return 1;
+}
+
+/* 用共享网格算 getEndHeightNoise；网格未覆盖时回退到未缓存实现。 */
+ES_FN float es_end_height_noise_g(const EsPerlin *island, const EsEndSimGrid *g,
+                                  int x, int z)
+{
+    const int hx = x / 2;
+    const int hz = z / 2;
+    const int oddx = x % 2;
+    const int oddz = z % 2;
+    const int i0 = hx - 12 - g->rx0;
+    const int j0 = hz - 12 - g->rz0;
+    int64_t h = 64 * (x * (int64_t)x + z * (int64_t)z);
+    float ret;
+    int i, j;
+
+    if (i0 < 0 || j0 < 0 || i0 + 24 >= g->nrx || j0 + 24 >= g->nrz)
+        return es_end_height_noise(island, x, z, 0);
+
+    for (j = 0; j < 25; j++) {
+        const int jj = j0 + j;
+        const int oz = oddz - 2 * (j - 12);
+        for (i = 0; i < 25; i++) {
+            const uint64_t v2 = g->v2[jj][i0 + i];
+            if (v2) {
+                const int ox = oddx - 2 * (i - 12);
+                const int64_t noise = ((int64_t)ox * ox + (int64_t)oz * oz)
+                                    * (int64_t)v2;
+                if (noise < h) h = noise;
+            }
+        }
+    }
+    if (h == 0) return 80.0f; /* 触顶：100 - 0 → clamp 80 */
+
+    ret = 100 - sqrtf((float)h);
+    if (ret < -100.0f) ret = -100.0f;
+    if (ret > 80.0f) ret = 80.0f;
+    return ret;
+}
+
 typedef struct EsEndWin {
     int cx0, cz0, ncx, ncz;
-    double v18[ES_END_WIN_MAXC][ES_END_WIN_MAXC]; /* [j][i] j=cz 方向 */
+    double d[ES_END_WIN_MAXC][ES_END_WIN_MAXC];    /* cell depth (= h_noise - 8) */
+    double v18[ES_END_WIN_MAXC][ES_END_WIN_MAXC];  /* [j][i] j = cz 方向 */
     double v19[ES_END_WIN_MAXC][ES_END_WIN_MAXC];
     unsigned char isvoid[ES_END_WIN_MAXC][ES_END_WIN_MAXC];
+    unsigned char need[ES_END_WIN_MAXC][ES_END_WIN_MAXC]; /* 需要 v18/v19 的 cell */
 } EsEndWin;
 
-ES_FN int es_end_win_prepare(const EsSurfaceNoise *sn, const EsPerlin *island,
-                            int xc, int zc, int w, EsEndWin *win)
+/* 只算 cell 的岛深（廉价：共享 simplex 网格）；不碰 SurfaceNoise。 */
+ES_FN int es_end_win_prepare_depth(const EsPerlin *island, int xc, int zc, int w,
+                                   EsEndWin *win)
 {
     const int cx_lo = (xc - w) >> 3;
     const int cx_hi = ((xc + w) >> 3) + 1;
     const int cz_lo = (zc - w) >> 3;
     const int cz_hi = ((zc + w) >> 3) + 1;
+    EsEndSimGrid grid;
     int i, j;
 
     win->cx0 = cx_lo;
@@ -366,28 +454,85 @@ ES_FN int es_end_win_prepare(const EsSurfaceNoise *sn, const EsPerlin *island,
     win->ncx = cx_hi - cx_lo + 1;
     win->ncz = cz_hi - cz_lo + 1;
     if (win->ncx > ES_END_WIN_MAXC || win->ncz > ES_END_WIN_MAXC) return 0;
+    if (!es_end_sim_grid_build(island, cx_lo, cx_hi, cz_lo, cz_hi, &grid)) return 0;
 
     for (j = 0; j < win->ncz; j++) {
         for (i = 0; i < win->ncx; i++) {
             const int cx = cx_lo + i;
             const int cz = cz_lo + j;
+            win->need[j][i] = 0;
+            win->v18[j][i] = 0.0;
+            win->v19[j][i] = 0.0;
             if (es_end_column_void(cx, cz)) {
                 win->isvoid[j][i] = 1;
-                win->v18[j][i] = 0.0;
-                win->v19[j][i] = 0.0;
+                win->d[j][i] = -108.0;
                 continue;
             }
             win->isvoid[j][i] = 0;
-            {
-                const double depth =
-                    (double)es_end_height_noise(island, cx, cz, 0) - 8.0;
-                win->v18[j][i] =
-                    es_end_column_cell_depth(sn, cx, 18, cz, depth, NULL);
-                win->v19[j][i] =
-                    es_end_column_cell_depth(sn, cx, 19, cz, depth, NULL);
-            }
+            win->d[j][i] = (double)es_end_height_noise_g(island, &grid, cx, cz) - 8.0;
         }
     }
+    return 1;
+}
+
+/* 方块列的四 cell 加权平均岛深 D_eff（判据里的关键标量）。
+ * 权重 (1-dx)(1-dz) / (1-dx)dz / dx(1-dz) / dx·dz。
+ * 任一 cell void → 返回 -1e30（该列无地形）。 */
+ES_FN double es_end_win_deff(const EsEndWin *win, int bx, int bz)
+{
+    const int i0 = (bx >> 3) - win->cx0;
+    const int j0 = (bz >> 3) - win->cz0;
+    const double dx = (double)(bx & 7) / 8.0;
+    const double dz = (double)(bz & 7) / 8.0;
+
+    if (i0 < 0 || j0 < 0 || i0 + 1 >= win->ncx || j0 + 1 >= win->ncz) return -1e30;
+    if (win->isvoid[j0][i0] || win->isvoid[j0][i0 + 1] || win->isvoid[j0 + 1][i0]
+        || win->isvoid[j0 + 1][i0 + 1])
+        return -1e30;
+    return (1 - dx) * (1 - dz) * win->d[j0][i0]
+         + (1 - dx) * dz * win->d[j0 + 1][i0]
+         + dx * (1 - dz) * win->d[j0][i0 + 1]
+         + dx * dz * win->d[j0 + 1][i0 + 1];
+}
+
+/* 只为 need=1 的 cell 算 v18/v19（其余保持未定义，调用方不得查询用到它们的列）。 */
+ES_FN void es_end_win_fill_noise(const EsSurfaceNoise *sn, EsEndWin *win)
+{
+    int i, j;
+    for (j = 0; j < win->ncz; j++)
+        for (i = 0; i < win->ncx; i++) {
+            if (!win->need[j][i] || win->isvoid[j][i]) continue;
+            {
+                const int cx = win->cx0 + i;
+                const int cz = win->cz0 + j;
+                const double depth = win->d[j][i];
+                win->v18[j][i] = es_end_column_cell_depth(sn, cx, 18, cz, depth, NULL);
+                win->v19[j][i] = es_end_column_cell_depth(sn, cx, 19, cz, depth, NULL);
+            }
+        }
+}
+
+/* 标记一个方块列用到的 4 个 cell（供 need 掩码）。 */
+ES_INLINE void es_end_win_mark(const EsEndWin *win, int bx, int bz, EsEndWin *dst)
+{
+    const int i0 = (bx >> 3) - win->cx0;
+    const int j0 = (bz >> 3) - win->cz0;
+    dst->need[j0][i0] = 1;
+    dst->need[j0][i0 + 1] = 1;
+    dst->need[j0 + 1][i0] = 1;
+    dst->need[j0 + 1][i0 + 1] = 1;
+}
+
+/* 深度 + 全部 cell 的噪声（自检 / 无过滤路径用）。 */
+ES_FN int es_end_win_prepare(const EsSurfaceNoise *sn, const EsPerlin *island,
+                            int xc, int zc, int w, EsEndWin *win)
+{
+    int i, j;
+    if (!es_end_win_prepare_depth(island, xc, zc, w, win)) return 0;
+    for (j = 0; j < win->ncz; j++)
+        for (i = 0; i < win->ncx; i++)
+            if (!win->isvoid[j][i]) win->need[j][i] = 1;
+    es_end_win_fill_noise(sn, win);
     return 1;
 }
 

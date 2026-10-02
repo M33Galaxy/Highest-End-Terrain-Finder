@@ -187,6 +187,8 @@ stage1 网格点失败原因分布（fail15 / fail_neigh / fail14 / fail13 / fai
 | `--threads N` | 硬件并发 | 循环点级动态调度 |
 | `--max-seeds N` | 全部 | 只取 envelope 最高的 N 个种子 |
 | `--max-loop-points N` | 不限 | 调试用：每种子最多枚举 N 个循环点 |
+| `--depth-thr F` | `62` | 跳过 `D_eff < F` 的列（合法区间 `-110..73`，见下节） |
+| `--no-depth-filter` | 关 | 关闭 D_eff 过滤（约慢 12×，作对照） |
 | `--out FILE` | 无 | 把所有 ≥73 的列写 CSV |
 | `--quiet` | 关 | 不打进度 |
 | `--selftest` | — | 内部一致性自检（见下） |
@@ -207,35 +209,61 @@ stage1 网格点失败原因分布（fail15 / fail_neigh / fail14 / fail13 / fai
 - 高度 74 ⟺ `y=3` 不成立且 `y=2` 成立；高度 75 ⟺ `y=3` 成立
 
 因此每列只需 **4 个 cell × celly{18,19} = 8 个噪声值**，而不是 4×33 = 132 个。
-工具还按窗口缓存 cell（每个 cell 的 depth 只算一次），否则每列会重复算 4 次
-25×25 岛深，慢约 30 倍。
 
-### 高度口径（重要）
+### depth 早期过滤（以及 74 的门槛）
 
-`end_island_noise.cuh` 逐字移植自 **cubiomes-end**：
+把上面那套写开就是一条**解析判据**（`D_eff` = 四个 cell 岛深的插值权重平均）：
 
-- `setEndSeed`（`setSeed` → `consumeCount(17292)` → perlinInit）＋ `sampleSimplex2D`
-  得到 25×25 外环的**外岛**项；
-- `getEndHeightNoise` = `min(64(x²+z²), 25×25 邻域内的 rsq'·v²)`；
-- `sampleSurfaceNoiseBetween(sn, cx, cy, cz, -128, +128)`（16 个 min/max octave + 8 个 main）；
-- `sampleNoiseColumnEnd` 的 `upper_drop`/`lower_drop` 与 `getSurfaceHeight` 的
-  `lerp3(dy,dx,dz,…)`、`blockspercell=4`、自上而下第一个 `noise>0`；
-- **1.14+ overflow void**：`(int)(cx²+cz²) < 0` 时整列 void（无地形）。这是真实行为，
-  在 ±10⁷ 量级会否掉相当一部分坐标，不能省。
+```text
+a·N18eff + b·N19eff  >  3000·(1-a-b) − (a+b)·D_eff
+a = (1-dy)·u18,  b = dy·u19,  u_c = clamp((78-c)/64, 0, 1)
+```
 
-仓库里其它高度实现（`front_dragon_hsum.cu` 的 `end_depth_simple`、
-`stage2_hotpath.cuh` 的 `end_island_depth`）**只在原点附近成立**：它们只有内岛项
-`100 - sqrt(64(cx²+cz²)) - 8`，`|cell| > ~25` 后被 clamp 到 −108，此时 cy=18 需要
-`noise > 308`（不可能），高度上限掉到 cy=14（Y≈59）。用它们跑 ±3000 万会**恒报"无地形"**。
+与已验证实现交叉验证 **1835 例 0 不一致**。等价写法是「加权噪声 + D_eff > 门槛」：
+
+| 高度 | 门槛 | 在 depth 上限 72 处需要的加权噪声 |
+| --- | --- | --- |
+| 73 | 213.3891 | > 141.39 |
+| **74** | **226.8908** | **> 154.891（≈155）** |
+| 75 | 240.5063 | > 168.51 |
+
+`depth ≤ 72` 是硬上限（`clamp(100−sqrt(h), −100, 80) − 8`），所以 **74 必须靠噪声 > 155**，
+和此前独立得到的「74 差不多要 envelope 155」完全一致。本战役实测：
+
+| 量 | 值 |
+| --- | --- |
+| 全量最大单 cell 噪声 | 154.5727 |
+| 命中列最大 N19eff | 154.5188 |
+| 最大余量 m2 = 加权噪声 + D_eff | 224.8430（差 **2.05**） |
+| 折算所需噪声 | 需 154.891，最好 154.573 → 差 **0.32** |
+| 最大余量 m3（75） | 225.6298（差 14.88） |
+
+最接近 74 的一列：`seed=694195937` 的 `block(-20828112,23028200)`，`D_eff = 72.0000`
+（四 cell 全在外岛中心）。而该战役扫描 CSV 里最好的 envelope 是 152.399，差 2.5 —— 所以那次
+战役不可能出 74。**73 的门槛在 depth 72 处只要 141.39**，这就是 73 满地都是、74 一个都没有的原因。
+
+于是 `period_height_check` 用两个闸把这些结论变成速度：
+
+| 闸 | 数据 | 效果 |
+| --- | --- | --- |
+| **非 void** | 全量 **50.1%** 的列是 void（`426,144,325 / 849,773,925`） | cell 级先判 void，省掉一半岛深计算 |
+| **D_eff 过滤**（`--depth-thr`，默认 62） | 命中列里最低 `D_eff` 正好 62.000000（来自外岛项 `rsq'=4, v=15 → h=900 → 92−30`） | 跳过 **97.6%** 的列，**保留 100% 的 366,031 个命中** |
+| **共享 simplex 网格** | 窗口内相邻 cell 的 `x/2` 中心最多差 1，所以 49 个 cell 的 49×625 次 simplex 塌缩成约 29×29 = 841 次 | 岛深部分 **~36×** |
+
+三者叠加：单点 1.5 ms → 约 0.13 ms，默认档 **88.3 s → 7.5 s（11.8×）**；
+`envelope > 137` 全扫（51,128 种子）从约 4 天降到 **约 8 小时**。
+
+`--depth-thr` 的语义是「跳过 `D_eff < 阈值`」。62 是本战役实测的紧阈值；想留冗余可以用
+55（保留 7.2% 的列，对应噪声门 158.4，留约 4 的余量），或 `--no-depth-filter` 关掉做对照。
 
 ### 默认档实测结果（end-hits-2B.csv：1e8–2e9 种子，51,128 个命中种子）
 
 ```bash
-./period_height_check --hits end-hits-2B.csv        # 8 线程, 88 秒
+./period_height_check --hits end-hits-2B.csv        # 8 线程, 7.5 秒
 ```
 
 `envelope > 148` → 13 个种子；每种子 `2d` / `±3000万` → `K=122` → 60,025 个循环点；
-共 780,325 个循环点 × 1089 列：
+共 780,325 个循环点 × 1089 列（过滤后只求值 2.36%）：
 
 | 项 | 值 |
 | --- | --- |
@@ -256,24 +284,48 @@ stage1 网格点失败原因分布（fail15 / fail_neigh / fail14 / fail13 / fai
   （150.329）在峰值 (8216,−14336) 本身就是 73，1,922 个循环点含 ≥73。
   envelope 只是 SurfaceNoise 侧的代理量，能不能到 73 还取决于当地的岛深/外岛项。
 
-### 成本（本机 8 逻辑核，`2d` / `±16` / step 1，每种子 60,025 循环点 ≈ 6.8 s）
+### 高度口径（重要）
 
-成本 ≈ `种子数 × (2K+1)²`，两点缩放规律：
+`end_island_noise.cuh` 逐字移植自 **cubiomes-end**：
+
+- `setEndSeed`（`setSeed` → `consumeCount(17292)` → perlinInit）＋ `sampleSimplex2D`
+  得到 25×25 外环的**外岛**项；
+- `getEndHeightNoise` = `min(64(x²+z²), 25×25 邻域内的 rsq'·v²)`；
+- `sampleSurfaceNoiseBetween(sn, cx, cy, cz, -128, +128)`（16 个 min/max octave + 8 个 main）；
+- `sampleNoiseColumnEnd` 的 `upper_drop`/`lower_drop` 与 `getSurfaceHeight` 的
+  `lerp3(dy,dx,dz,…)`、`blockspercell=4`、自上而下第一个 `noise>0`；
+- **1.14+ overflow void**：`(int)(cx²+cz²) < 0` 时整列 void（无地形）。这是真实行为，
+  在 ±10⁷ 量级会否掉相当一部分坐标，不能省。
+
+仓库里其它高度实现（`front_dragon_hsum.cu` 的 `end_depth_simple`、
+`stage2_hotpath.cuh` 的 `end_island_depth`）**只在原点附近成立**：它们只有内岛项
+`100 - sqrt(64(cx²+cz²)) - 8`，`|cell| > ~25` 后被 clamp 到 −108，此时 cy=18 需要
+`noise > 308`（不可能），高度上限掉到 cy=14（Y≈59）。用它们跑 ±3000 万会**恒报"无地形"**。
+
+顺带一句：(0,0) 处的 `depth` 恰好是 **72**，因为内岛项 `64·(0²+0²)=0 → 100−0=100`
+被 clamp 到 80 再 −8；外岛中心处 `h = rsq'·v² ≤ 400` 时同样触顶 72 —— 这就是
+`build/diag_origin72.cpp`（`D_EFF 72.0`）在查的那个 72。
+
+### 成本（本机 8 逻辑核，`2d` / `±16` / step 1）
+
+成本 ≈ `种子数 × (2K+1)²`（`K = floor(range / 245133.2823)`），每种子 60,025 个循环点
+≈ **0.58 s**（实测 13 种子 7.5 s）。两点缩放规律：
 
 | 缩放 | 倍率 |
 | --- | --- |
 | `--range` 从 3000 万降到 123 万（K=122→4） | ×1/741 |
 | `--window-step` 从 1 改 2（1089→289 列） | ×1/3.8 |
+| `--no-depth-filter` | 约 ×12 慢 |
 
 按阈值外推（默认 range）：
 
 | `--envelope-thr` | 种子数 | 预计 |
 | --- | --- | --- |
-| 148 | 13 | 88 s（实测） |
-| 146 | 75 | ~9 min |
-| 145 | 203 | ~23 min |
-| 144 | 451 | ~51 min |
-| 137 | 51,128 | ~4 天（需 GPU 化，或把 range 缩到 ±123 万 → ~8 min） |
+| 148 | 13 | **7.5 s**（实测） |
+| 146 | 75 | ~45 s |
+| 145 | 203 | ~2 min |
+| 144 | 451 | ~4.5 min |
+| 137 | 51,128 | ~8 小时（优化前约 4 天） |
 
 ### 输出
 
@@ -284,15 +336,21 @@ stage1 网格点失败原因分布（fail15 / fail_neigh / fail14 / fail13 / fai
 
 ### 已做的验证
 
-- `--selftest`：缓存版（`es_end_height73_cached`）== 直算版（`es_end_height73`）
-  == 完整 132 列高度版（`es_end_height_exact`）在 ≥73 上的一致性，50 例全过。
+- `--selftest`：
+  1. 缓存版（`es_end_height73_cached`）== 直算版（`es_end_height73`）== 完整 132 列
+     高度版（`es_end_height_exact`）在 ≥73 上的一致性，**50 例全过**；
+  2. 共享 simplex 网格的 depth == 未缓存 `es_end_height_noise`、过滤路径 == 全量路径、
+     且**没有任何 ≥73 的列被 D_eff 过滤丢掉**，共 **5625 项检查全过**。
 - **与 cubiomes 对拍**：用 `tools/cubiomes_height_probe.c`（直接调 cubiomes-end 的
   `getEndSurfaceHeight`，编译方式见文件头注释）在 5 个种子 × 已知锚点
   （`h(-29,28)=69`、`h(0,0)=62`）以及 13 个 `envelope>148` 种子 × 25 个远距离循环点
   （含 `k=±122`，即 ±2990 万格，覆盖 float 截断与 void 分支）共 325 个坐标上，
-  **逐点完全一致（0 处不一致）**。
-- **对工具实际报出的命中点对拍**：`--out` 产出 651 条 `h=73` 记录，随机抽 8 条
-  用 cubiomes 复核，**8/8 一致**。
+  **逐点完全一致（0 处不一致）**；解析判据本身也在全量数据上交叉验证 1835 例 0 不一致。
+- **对工具实际报出的命中点对拍**：`--out` 的命中记录随机抽样（651 条那次抽 8 条、
+  优化后 9879 条那次再抽 8 条）用 cubiomes 复核，**16/16 一致**。
+- **优化不改变结果**：`--range 5000000` 下 `--depth-thr 62` 与 `--no-depth-filter`
+  各跑一次 `--out`，**排序后行集合逐字节相同**（9879 行）；全量默认档优化前后
+  都是 **9,547 / 366,031 / 0 / 0**（CSV 行序本身在多线程下不确定，故按行集合比）。
 
 ## 关键常量（`end_surface_noise.cuh`）
 
