@@ -77,7 +77,7 @@ g++ -O3 -std=c++17 -pthread -x c++ -o period_height_check period_height_check.cu
 | `--s1-gradvec-max-fail` | `1` | `0`=allow0，`1`=allow1，`2`=soft |
 | `--s1-grid-par` / `--no-s1-grid-par` | 开 | 见「两种 stage1 执行方式」 |
 | `--s1-grid-par-threads` | `256` | 32..1024，每种子 block 的线程数 |
-| `--period-range` | `30000000` | 周期平移搜索半径（±格） |
+| `--period-range` | `122566` | 周期平移搜索半径（±格）。默认 = **一个总周期**：`T = 5P = 245133.2823`，`±T/2 ≈ ±122566` ⟹ `kMax = floor(122566/P) = 2`，即 5×5 = 25 个晶格点，正好把 5 个相位类各覆盖一次 |
 | `--celly` | `18` | 采样 cell 的 Y（Y=72 → 18） |
 | `--max-hits` | `2000000` | 命中上限（同时决定 host/device 缓冲大小） |
 | `--no-phase` / `--no-yoffset` | 关 | 关闭 y_offset 相位预筛（等价 `--phase-thr -1e9`） |
@@ -359,7 +359,7 @@ a = (1-dy)·u18,  b = dy·u19,  u_c = clamp((78-c)/64, 0, 1)
 | `ES_WORLD_Y` | `72` | 目标 Y |
 | `ES_CELLY` | `18` | `ES_WORLD_Y / 4` |
 | `ES_PERIOD` | `49026.65646` | main 噪声周期（格） |
-| `ES_PERIOD_RANGE` | `30000000` | 平移半径 |
+| `ES_PERIOD_RANGE` | `122566` | 平移半径 = 一个总周期 `±T/2`（见下「来源」的差异说明） |
 | `ES_MAIN_PHASE_MOD` | `5` | 平移相位类数 |
 | 门控链 | `55 / 60 / 100 / 110 / 130 / 137` | oct15 / 邻域 / oct14 / oct13 / stage2 / stage3 |
 | `ES_STAGE2_RANGE/STEP` | `48 / 16` | stage2 |
@@ -383,7 +383,14 @@ a = (1-dy)·u18,  b = dy·u19,  u_c = clamp((78-c)/64, 0, 1)
 扫描器的三个文件是从一个更大工作区的
 `projects/end-surface-period-standalone/cuda/` 中抽出的**最小可编译闭包**：
 `end_surface_period_scan.cu` → `end_surface_noise.cuh` → `end_phase_lut.cuh`，
-再无其它 include，三个文件内容与上游逐字节一致，便于日后 diff 同步。
+再无其它 include，便于日后 diff 同步。
+
+**与上游的唯一差异**：`end_surface_noise.cuh` 里
+`ES_PERIOD_RANGE` 由 `30000000` 改为 `122566`（一个总周期 `±T/2`），
+于是主程序默认只在一个总周期内走完 5 个相位类（5×5 = 25 个晶格点），
+远处交给 `period_height_check` 按整周期 `T` 平移去验真实高度 —— 两个程序分工不重叠。
+其余内容仍与上游逐字节一致；要回退上游行为，把该行改回 `30000000`
+（或运行时显式 `--period-range 30000000`）即可。
 
 `.gitattributes` 按上游行尾固定：`.cu` 为 CRLF，`.cuh` 为 LF，
 存储层统一 LF，因此 clone 后的文件与上游字节相同。

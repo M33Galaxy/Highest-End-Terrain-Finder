@@ -71,7 +71,11 @@ ES_GRAD_MASK_ATTR uint16_t ES_GRAD_ALLOW1_K8[8] = {
 #define ES_STAGE3_STEP 2
 
 #define ES_PERIOD 49026.65646
-#define ES_PERIOD_RANGE 30000000
+/* 周期平移半径。默认 = 一个**总周期**：T = 5*P = 245133.2823，±T/2 = ±122566
+ * ⟹ kMax = floor(122566/P) = 2，5x5 = 25 个晶格点，正好覆盖全部 5 个相位类一次。
+ * （上游原值 30000000；本仓库按"主程序只走一个总周期、远处交给 period_height_check
+ * 按整周期 T 平移去验真实高度"的分工改为此值。改动会同时影响 CLI 默认与 usage 文本。） */
+#define ES_PERIOD_RANGE 122566
 #define ES_MAIN_PHASE_MOD 5
 #define ES_YOFFSET_SCORE_MIN 1.5
 
