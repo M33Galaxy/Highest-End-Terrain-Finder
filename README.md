@@ -1,31 +1,44 @@
-# 末地 SurfaceNoise 周期高点扫描器（CUDA）
+# 末地 SurfaceNoise 周期高点扫描器 + 真实高度校验（CUDA / host）
 
-用末地 `SurfaceNoise` 的 **main 噪声周期** `P ≈ 49026.656` 格，在给定种子区间里找出
-**末地最高地形**候选点：先在 Y=72（`celly=18`）平面上筛出落在 `SurfaceNoise` 包络高位的
-点（min/max 两个 branch），再把该点按周期晶格平移 `k·P`（`|k·P| ≤ period_range`），
-用 `vmain` 逐点复核，输出所有仍然成立的 `(seed, tx, tz)`。
+两个工具：
 
-程序是单文件 CUDA 可执行文件，**只依赖** 同目录两个头文件，无第三方库、无 cubiomes。
+1. **`end_surface_period_scan`**（CUDA）— 用末地 `SurfaceNoise` 的 **main 噪声周期**
+   `P ≈ 49026.656` 格，在给定种子区间里找出**末地最高地形**候选点：先在 Y=72
+   （`celly=18`）平面上筛出落在 `SurfaceNoise` 包络高位的点（min/max 两个 branch），
+   再把该点按周期晶格平移 `k·P`（`|k·P| ≤ period_range`），用 `vmain` 逐点复核，
+   输出所有仍然成立的 `(seed, tx, tz)`。
+2. **`period_height_check`**（host）— 读上面的 CSV，对 `envelope` 超阈值的种子，
+   按**真实地表噪声周期** `T = 245133.2823`（`= 5P`）枚举周期循环点，
+   在每个点 ±16 格内用 cubiomes 口径的**真实末地地表高度**判定是否 ≥ 73，
+   出现 74/75 立刻打屏。详见下文「高度检查」一节。
+
+扫描程序是单文件 CUDA 可执行文件；高度检查是单文件 host 程序。两者都只依赖同目录头文件，
+无第三方库、**不链接 cubiomes**（高度函数是按 cubiomes 逐字移植并对拍验证的）。
 
 ```text
-end_surface_period_scan.cu   主程序（kernel + CLI + CSV 输出）
+end_surface_period_scan.cu   扫描主程序（kernel + CLI + CSV 输出，nvcc）
 end_surface_noise.cuh        末地噪声原语：Java LCG、Perlin、oct13/14/15、vmain、y_offset 预筛
 end_phase_lut.cuh            y_offset 相位 32-bin LUT 权重（自动生成，勿手改）
+period_height_check.cu       高度检查工具（host，g++/nvcc 均可编）
+end_island_noise.cuh         真实末地地表高度：外岛 simplex + getEndHeightNoise + 列/插值
 ```
 
 ## 构建
 
-需要 CUDA Toolkit（`nvcc`），无需其它依赖：
+扫描程序需要 CUDA Toolkit（`nvcc`）；高度检查只需要一个 C++17 编译器（无需 CUDA）：
 
 ```bash
-# Linux / Colab / AutoDL
+# 扫描器：Linux / Colab / AutoDL
 nvcc -O3 -std=c++17 -arch=sm_89 -o end_surface_period_scan end_surface_period_scan.cu
 
-# Windows
+# 扫描器：Windows
 nvcc -O3 -std=c++17 -arch=native -o end_surface_period_scan.exe end_surface_period_scan.cu
+
+# 高度检查（host，注意 .cu 要显式 -x c++，与本仓库其它 host 版 .cu 一致）
+g++ -O3 -std=c++17 -pthread -x c++ -o period_height_check period_height_check.cu -lm
 ```
 
-换架构改 `-arch` 即可（例如 `sm_75` / `sm_86` / `sm_89`）。程序在 host 侧检查
+换架构改 `-arch` 即可（例如 `sm_75` / `sm_86` / `sm_89`）。扫描程序在 host 侧检查
 动态 shared memory 是否超过 48 KB，超了会直接报错退出。
 
 ## 用法
@@ -149,6 +162,138 @@ seed,branch,stage1_x,stage1_z,envelope,peak_x,peak_z,tx,tz,vmain
 （seed / phase_fail / s1_fail / s2_pass / s3_pass …）、各阶段 cycle 占比，以及
 stage1 网格点失败原因分布（fail15 / fail_neigh / fail14 / fail13 / fail_br）。
 
+## 高度检查：`period_height_check`
+
+扫描程序只输出 **SurfaceNoise 包络**高的候选点，它**不是**高度。要回答「这些周期循环点
+那里真的有 Y≥73 的地表吗」，用 `period_height_check`：
+
+```bash
+./period_height_check --hits hits.csv                      # 默认: env>148, ±3000万, 2d, ±16
+./period_height_check --hits hits.csv --envelope-thr 146   # 放宽到 75 个种子
+./period_height_check --hits hits.csv --range 1225660 --out hits73.csv
+```
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--hits FILE` | 必填 | 扫描程序输出的 CSV |
+| `--envelope-thr F` | `148` | 只查 `envelope > F` 的种子（合法区间 `137..152`，超出直接报错） |
+| `--range N` | `30000000` | 循环点搜索半径 ±N 格（合法区间 `122566..30000000`） |
+| `--window W` | `16` | 每个循环点检查 ±W 格 |
+| `--window-step S` | `1` | 窗口步长（`1` = 穷举 33×33 = 1089 列） |
+| `--period F` | `245133.2823` | 真实地表噪声周期 `T = 5P`（= `ES_MAIN_PHASE_MOD × ES_PERIOD`） |
+| `--loop MODE` | `2d` | `2d`（全部 kx,kz 组合）/ `cross`（两轴各一条线）/ `1d`（单轴） |
+| `--threads N` | 硬件并发 | 循环点级动态调度 |
+| `--max-seeds N` | 全部 | 只取 envelope 最高的 N 个种子 |
+| `--max-loop-points N` | 不限 | 调试用：每种子最多枚举 N 个循环点 |
+| `--out FILE` | 无 | 把所有 ≥73 的列写 CSV |
+| `--quiet` | 关 | 不打进度 |
+| `--selftest` | — | 内部一致性自检（见下） |
+
+`--range` 用 `T=245133.2823` 换算：`K = floor(range / T)`，每轴 `2K+1` 个点，
+`2d` 模式每种子 `(2K+1)²` 个循环点。注意 **`--range 122566` 时 `K=0`**，
+每轴只有 1 个点，即只检查峰值本身（这是规格下限的必然结果）。
+
+### 为什么只查 celly 18
+
+末地地表的列密度是 `lerp(upper_drop[y], -3000, noise + depth)` 再 `lerp(lower_drop[y], -30, …)`，
+其中 `upper_drop[y] = clamp((78-y)/64)`。成实心需要
+`u·(noise+depth+3000) > 3000`，而 `depth ≤ +72`、`noise ≲ +152`，所以
+`u > 15/16` 是硬条件 —— 这恰好是 **cy=18**（`(78-18)/64 = 15/16`，cubiomes
+`biomenoise.c:602-609` 的注释给出同一结论）。于是：
+
+- 高度 ≥ 73 ⟺ cy=18 内存在实心块（`y=1/2/3` 任一 `noise > 0`）
+- 高度 74 ⟺ `y=3` 不成立且 `y=2` 成立；高度 75 ⟺ `y=3` 成立
+
+因此每列只需 **4 个 cell × celly{18,19} = 8 个噪声值**，而不是 4×33 = 132 个。
+工具还按窗口缓存 cell（每个 cell 的 depth 只算一次），否则每列会重复算 4 次
+25×25 岛深，慢约 30 倍。
+
+### 高度口径（重要）
+
+`end_island_noise.cuh` 逐字移植自 **cubiomes-end**：
+
+- `setEndSeed`（`setSeed` → `consumeCount(17292)` → perlinInit）＋ `sampleSimplex2D`
+  得到 25×25 外环的**外岛**项；
+- `getEndHeightNoise` = `min(64(x²+z²), 25×25 邻域内的 rsq'·v²)`；
+- `sampleSurfaceNoiseBetween(sn, cx, cy, cz, -128, +128)`（16 个 min/max octave + 8 个 main）；
+- `sampleNoiseColumnEnd` 的 `upper_drop`/`lower_drop` 与 `getSurfaceHeight` 的
+  `lerp3(dy,dx,dz,…)`、`blockspercell=4`、自上而下第一个 `noise>0`；
+- **1.14+ overflow void**：`(int)(cx²+cz²) < 0` 时整列 void（无地形）。这是真实行为，
+  在 ±10⁷ 量级会否掉相当一部分坐标，不能省。
+
+仓库里其它高度实现（`front_dragon_hsum.cu` 的 `end_depth_simple`、
+`stage2_hotpath.cuh` 的 `end_island_depth`）**只在原点附近成立**：它们只有内岛项
+`100 - sqrt(64(cx²+cz²)) - 8`，`|cell| > ~25` 后被 clamp 到 −108，此时 cy=18 需要
+`noise > 308`（不可能），高度上限掉到 cy=14（Y≈59）。用它们跑 ±3000 万会**恒报"无地形"**。
+
+### 默认档实测结果（end-hits-2B.csv：1e8–2e9 种子，51,128 个命中种子）
+
+```bash
+./period_height_check --hits end-hits-2B.csv        # 8 线程, 88 秒
+```
+
+`envelope > 148` → 13 个种子；每种子 `2d` / `±3000万` → `K=122` → 60,025 个循环点；
+共 780,325 个循环点 × 1089 列：
+
+| 项 | 值 |
+| --- | --- |
+| 含 ≥73 的循环点 | **9,547**（1.2%） |
+| ≥73 的列 | **366,031** |
+| 最大高度 | **73** |
+| 出现 74 / 75 | **0 / 0** |
+| 有 ≥73 的种子 | **11 / 13**（`525351041`、`378335108` 没有） |
+
+几个值得注意的现象：
+
+- **最高就是 73，一个 74/75 都没有。** 机制上说得通：cy=18 内 `upper_drop` 对
+  y=1/2/3 是同一个 u，差别只来自插值的 `dy`；而更高一层的 `col[cy=19]` 被拉向 −3000
+  更多，所以 `dy` 越小的 y 越容易为正 —— 也就是 **y=1（高度 73）最先成立**，
+  74/75 需要明显更强的密度。整个 workspace 找的 Y73/74 里，74 属于罕见事件。
+- **envelope 排名 ≠ 高度。** 最高 envelope 的种子 `1400753836`（152.399）在峰值 ±16
+  内的最大高度只有 69，全部 60,025 个循环点里只有 429 个含 ≥73；而 `694195937`
+  （150.329）在峰值 (8216,−14336) 本身就是 73，1,922 个循环点含 ≥73。
+  envelope 只是 SurfaceNoise 侧的代理量，能不能到 73 还取决于当地的岛深/外岛项。
+
+### 成本（本机 8 逻辑核，`2d` / `±16` / step 1，每种子 60,025 循环点 ≈ 6.8 s）
+
+成本 ≈ `种子数 × (2K+1)²`，两点缩放规律：
+
+| 缩放 | 倍率 |
+| --- | --- |
+| `--range` 从 3000 万降到 123 万（K=122→4） | ×1/741 |
+| `--window-step` 从 1 改 2（1089→289 列） | ×1/3.8 |
+
+按阈值外推（默认 range）：
+
+| `--envelope-thr` | 种子数 | 预计 |
+| --- | --- | --- |
+| 148 | 13 | 88 s（实测） |
+| 146 | 75 | ~9 min |
+| 145 | 203 | ~23 min |
+| 144 | 451 | ~51 min |
+| 137 | 51,128 | ~4 天（需 GPU 化，或把 range 缩到 ±123 万 → ~8 min） |
+
+### 输出
+
+- **立刻打屏**（满足「出现 74 直接打印」）：`[74] seed=… x=… z=… (peak=… k=(kx,kz) base=…)`
+- 每个种子的汇总：循环点数、含 ≥73 的循环点数、≥73 的列数、最大高度、最佳坐标
+- 末尾合计 + 结论（这些种子里到底有没有 ≥73）
+- `--out` 另把所有 ≥73 的列写 CSV
+
+### 已做的验证
+
+- `--selftest`：缓存版（`es_end_height73_cached`）== 直算版（`es_end_height73`）
+  == 完整 132 列高度版（`es_end_height_exact`）在 ≥73 上的一致性，50 例全过。
+- **与 cubiomes 对拍**：用 `tools/cubiomes_height_probe.c`（直接调 cubiomes-end 的
+  `getEndSurfaceHeight`，编译方式见文件头注释）在 5 个种子 × 已知锚点
+  （`h(-29,28)=69`、`h(0,0)=62`）以及 13 个 `envelope>148` 种子 × 25 个远距离循环点
+  （含 `k=±122`，即 ±2990 万格，覆盖 float 截断与 void 分支）共 325 个坐标上，
+  **逐点完全一致（0 处不一致）**。
+- **对工具实际报出的命中点对拍**：`--out` 产出 651 条 `h=73` 记录，随机抽 8 条
+  用 cubiomes 复核，**8/8 一致**。
+
 ## 关键常量（`end_surface_noise.cuh`）
 
 | 常量 | 值 | 含义 |
@@ -172,14 +317,28 @@ stage1 网格点失败原因分布（fail15 / fail_neigh / fail14 / fail13 / fai
   点上有约 10% 漏检。
 - 源码中标注 `TEMP` 的项：stage1 gradvec 默认 `allow1 / topk=4`，以及 `--profile`
   系列计数。它们影响速度与召回，属于可调实验默认值，用 `--no-s1-gradvec` 可关闭。
-- 当前版本**不含**岛屿/高度（islands/height）判定，只做包络 + 周期晶格 + `vmain`。
+- 扫描程序**不含**岛屿/高度（islands/height）判定，只做包络 + 周期晶格 + `vmain`；
+  「真实高度」由 `period_height_check` 负责，两者口径都在 cubiomes 侧对拍过。
 
 ## 来源
 
-本仓库是从一个更大工作区的 `projects/end-surface-period-standalone/cuda/` 中
-抽出的**最小可编译闭包**：`end_surface_period_scan.cu` → `end_surface_noise.cuh`
-→ `end_phase_lut.cuh`，再无其它 include，三个文件内容与上游逐字节一致，
-便于日后 diff 同步。
+扫描器的三个文件是从一个更大工作区的
+`projects/end-surface-period-standalone/cuda/` 中抽出的**最小可编译闭包**：
+`end_surface_period_scan.cu` → `end_surface_noise.cuh` → `end_phase_lut.cuh`，
+再无其它 include，三个文件内容与上游逐字节一致，便于日后 diff 同步。
 
 `.gitattributes` 按上游行尾固定：`.cu` 为 CRLF，`.cuh` 为 LF，
 存储层统一 LF，因此 clone 后的文件与上游字节相同。
+
+高度侧的两个文件是本仓库新增的（上游没有等价物）：
+
+- `end_island_noise.cuh` — 逐字移植自
+  `projects/codex-minecraft-seed-methodology/third_party/cubiomes-end/`
+  的 `biomenoise.c`（`setEndSeed` / `getEndHeightNoise` / `sampleSurfaceNoiseBetween` /
+  `sampleNoiseColumnEnd` / `getSurfaceHeight`）、`noise.c`（`sampleSimplex2D` /
+  `simplexGrad`）、`rng.h`（`skipNextN`），并保持 `EsPerlin` 与本仓库
+  `end_surface_noise.cuh` 的表示一致 —— 所以**不引入 cubiomes 依赖**。
+- `period_height_check.cu` — 新写的工具。
+
+移植的验证方式见上文「已做的验证」：用 cubiomes-end 源码现编
+`getEndSurfaceHeight` 探针对拍。
